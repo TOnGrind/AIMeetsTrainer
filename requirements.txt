@@ -1,0 +1,15 @@
+# Kern
+ultralytics>=8.3.0
+opencv-python>=4.9.0.80
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+matplotlib>=3.8
+tqdm>=4.66
+
+# PyTorch (für spätere Modelle)
+torch>=2.2
+torchvision>=0.17
+
+# TensorFlow (alternativ, falls du TF nutzen willst)
+tensorflow>=2.15
