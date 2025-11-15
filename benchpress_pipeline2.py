@@ -67,35 +67,37 @@ def get_points(landmarks, w, h, side="auto"):
     SH, EL, WR, HP = xy(S["SH"]), xy(S["EL"]), xy(S["WR"]), xy(S["HP"])
     return side, SH, EL, WR, HP
 
-# ------------------ Phasen-/Rep-Logik (entschärft & parametrisierbar) ------------------
+# ------------------ Phasen-/Rep-Logik (robuster) ------------------
 class RepStateMachine:
     """
-    Entscheidet auf Basis von GLEITENDEN MITTELN (k-Frames) über Winkel & Geschwindigkeit.
-    DOWN: Winkel nimmt ab (neg. vel), UP: Winkel nimmt zu (pos. vel)
-    TOP/BOTTOM: Winkel nahe Schwelle + geringe |vel| über min_state_frames.
-    Alle Stellschrauben sind im Ctor.
+    FSM mit:
+      - completed_bottom-Gating: rep++ nur nach echtem Bottom
+      - Top-Lock: Sperrzeit nach rep++, um Ghost-Reps oben zu vermeiden
+      - Zeitbasierter Mindestdauer (_enough(t)) statt Frames
     """
     def __init__(self,
                  fps,
                  top_deg=None, bottom_deg=None,
-                 vel_eps=3.0,            # °/s: Stillstand (entschärft)
-                 hysteresis=7.0,         # °: Hysterese für Top/Bottom (entschärft)
-                 dwell_bottom_max=1.5,   # s: zu lange unten => Fail
-                 min_state_frames=2,     # Mindestdauer pro Zustand (entschärft)
-                 mean_k=5,               # Gleitfenster (Frames) für Entscheidungen
-                 backslide_v=5.0         # °/s: in UP negative v < -backslide_v => Fehler
+                 vel_eps=3.0,
+                 hysteresis=7.0,
+                 dwell_bottom_max=1.5,
+                 min_state_frames=2,
+                 mean_k=5,
+                 backslide_v=5.0,
+                 top_lock_s=0.8          # <— NEU: Sperrzeit oben nach rep++
                  ):
-        self.fps = fps
+        self.fps = float(fps)
         self.vel_eps = float(vel_eps)
         self.hyst = float(hysteresis)
         self.dwell_bottom_max = float(dwell_bottom_max)
         self.min_state_frames = int(max(1, min_state_frames))
+        self.min_state_time_s = self.min_state_frames / max(1.0, self.fps)  # <— zeitbasiert
         self.backslide_v = float(backslide_v)
 
         self.top_deg = top_deg
         self.bottom_deg = bottom_deg
 
-        self.phase = "TOP"   # Start in Top
+        self.phase = "TOP"
         self.rep_id = 0
         self.rep_status = "ok"
 
@@ -103,11 +105,18 @@ class RepStateMachine:
         self.awaited_bottom = False
         self.awaited_top = False
 
-        # Rolling Means für weichere Logik
+        # Rep-Gating & Top-Lock
+        self.completed_bottom = False      # <— Nur wenn True, darf oben gezählt werden
+        self.last_rep_time = None          # <— Zeitpunkt des letzten rep++
+        self.top_lock_s = float(top_lock_s)
+
+        # Rolling Means
         self.rm_angle = RollingMean(k=mean_k)
         self.rm_vel   = RollingMean(k=mean_k)
 
+        # Zeit-/Zustandsverwaltung
         self._phase_frames = 0
+        self._state_enter_time = 0.0       # <— für _enough(t)
 
     def _is_top(self, elbow_deg_m):
         return elbow_deg_m >= (self.top_deg - self.hyst)
@@ -115,100 +124,107 @@ class RepStateMachine:
         return elbow_deg_m <= (self.bottom_deg + self.hyst)
     def _still(self, vel_m):
         return abs(vel_m) < self.vel_eps
-    def _enough(self):
-        return self._phase_frames >= self.min_state_frames
+    def _enough(self, t):
+        return (t - self._state_enter_time) >= self.min_state_time_s
+
+    def _enter(self, new_phase, t):
+        self.phase = new_phase
+        self._phase_frames = 0
+        self._state_enter_time = float(t)
 
     def update(self, t, elbow_deg, elbow_vel):
         """
-        t: Zeit (s), elbow_deg/vel: bereits geglättet; wir mitteln zusätzlich über mean_k.
+        t: Zeit (s), elbow_deg/vel bereits geglättet; RollingMean mittelt zusätzlich.
         Returns: (phase, direction, rep_id, rep_status, event)
-        direction: -1 runter, +1 hoch, 0 still
-        event: 'rep++' | 'fail:<grund>' | None
         """
         event = None
-
-        # Initialschwellen (Fallback)
         if self.top_deg is None: self.top_deg = 170.0
         if self.bottom_deg is None: self.bottom_deg = 110.0
 
-        # Rolling Means
         ang_m = self.rm_angle.push(elbow_deg)
         vel_m = self.rm_vel.push(elbow_vel if not np.isnan(elbow_vel) else 0.0)
 
-        # Richtung
         if np.isnan(vel_m) or self._still(vel_m): direction = 0
         elif vel_m < 0: direction = -1
         else: direction = +1
 
         self._phase_frames += 1
 
+        # TOP-Lock: nach rep++ kurze Sperrzeit für neue Bewegungen/Wechsel
+        if self.phase == "TOP" and self.last_rep_time is not None:
+            if (t - self.last_rep_time) < self.top_lock_s:
+                # Sperre: bleib in TOP, kein Zustandswechsel
+                return self.phase, 0, self.rep_id, self.rep_status, None
+
         if self.phase == "TOP":
             # TOP -> DOWN: klare Abwärtsbewegung + Top verlassen
-            if direction < 0 and not self._is_top(ang_m) and self._enough():
-                self.phase = "DOWN"
-                self._phase_frames = 0
+            if direction < 0 and not self._is_top(ang_m) and self._enough(t):
                 self.awaited_bottom = True
                 self.rep_status = "ok"
+                self._enter("DOWN", t)
+
+ 
 
         elif self.phase == "DOWN":
-            # DOWN -> BOTTOM: BOTTOM erreicht + (nahe) Stillstand
-            if self._is_bottom(ang_m) and self._still(vel_m) and self._enough():
-                self.phase = "BOTTOM"
-                self._phase_frames = 0
+            # 1) Klassische Bottom-Erkennung (unten + still)
+            if self._is_bottom(ang_m) and self._still(vel_m) and self._enough(t):
                 self.in_bottom_since = t
                 self.awaited_bottom = False
-            # Richtungswechsel nach oben, bevor unten erreicht -> Fail aber weiter
-            elif direction > 0 and self.awaited_bottom and self._enough():
-                self.rep_status = "fail:no_bottom"
-                event = "fail:no_bottom"
-                self.phase = "UP"
-                self._phase_frames = 0
+                self.completed_bottom = True
+                self._enter("BOTTOM", t)
+
+            # 2) NEU: Richtungswechsel im Bottom-Bereich gilt als "echter Bottom"
+            elif (direction > 0) and self._is_bottom(ang_m) and self._enough(t):
+                self.completed_bottom = True          # <— entscheidend
                 self.awaited_bottom = False
                 self.awaited_top = True
+                self._enter("UP", t)
+
 
         elif self.phase == "BOTTOM":
             # Zu lange unten?
             if self.in_bottom_since is not None and (t - self.in_bottom_since) > self.dwell_bottom_max:
-                if not self.rep_status.startswith("fail"):
-                    self.rep_status = "fail:long_bottom"
-                    event = "fail:long_bottom"
+                if not str(self.rep_status).startswith("fail"):
+                    self.rep_status = "fail:long_bottom"; event = "fail:long_bottom"
             # Start nach oben
-            if direction > 0 and self._enough():
-                self.phase = "UP"
-                self._phase_frames = 0
-                self.in_bottom_since = None
+            if direction > 0 and self._enough(t):
                 self.awaited_top = True
+                self.in_bottom_since = None
+                self._enter("UP", t)
 
         elif self.phase == "UP":
             # Backslide (während UP wieder deutlich nach unten)
-            if vel_m < -self.backslide_v and self._enough():
-                self.rep_status = "fail:backslide_up"
-                event = "fail:backslide_up"
-                self.phase = "DOWN"
-                self._phase_frames = 0
+            if vel_m < -self.backslide_v and self._enough(t):
+                self.rep_status = "fail:backslide_up"; event = "fail:backslide_up"
                 self.awaited_top = False
                 self.awaited_bottom = True
+                self._enter("DOWN", t)
             # UP -> TOP: oben erreicht + Stillstand
-            elif self._is_top(ang_m) and self._still(vel_m) and self._enough():
-                self.phase = "TOP"
-                self._phase_frames = 0
+            elif self._is_top(ang_m) and self._still(vel_m) and self._enough(t):
+                # WICHTIG: rep++ nur wenn vorher echter BOTTOM
+                if self.completed_bottom:
+                    self.rep_id += 1
+                    event = "rep++"
+                    self.last_rep_time = t          # <— Start Top-Lock
+                else:
+                    # oben ohne echten Bottom -> als „no_bottom“ markieren (optional)
+                    if not str(self.rep_status).startswith("fail"):
+                        self.rep_status = "fail:no_bottom"
+                        event = "fail:no_bottom"
+                # Reset für nächsten Zyklus
+                self.completed_bottom = False
                 self.awaited_top = False
-                # Repabschluss – auch wenn vorher Fail markiert, rep_id inkrementieren,
-                # der Status bleibt „ok“ oder „fail:<grund>“ als Info.
-                self.rep_id += 1
-                event = "rep++"
-                # nach Abschluss zurücksetzen (nächster Rep startet neutral)
-                self.rep_status = "ok"
-            # Richtungswechsel nach unten, bevor TOP erreicht -> Fail, zurück DOWN
-            elif direction < 0 and self.awaited_top and self._enough():
-                self.rep_status = "fail:no_top"
-                event = "fail:no_top"
-                self.phase = "DOWN"
-                self._phase_frames = 0
+                self.rep_status = "ok" if event == "rep++" else self.rep_status
+                self._enter("TOP", t)
+            # Richtungswechsel nach unten, bevor TOP erreicht
+            elif direction < 0 and self.awaited_top and self._enough(t):
+                self.rep_status = "fail:no_top"; event = "fail:no_top"
                 self.awaited_top = False
                 self.awaited_bottom = True
+                self._enter("DOWN", t)
 
         return self.phase, direction, self.rep_id, self.rep_status, event
+
 
 # ------------------ Hauptpipeline ------------------
 def process_video(
@@ -383,23 +399,44 @@ def process_video(
     # Plots
     plt.figure(figsize=(12,5))
     plt.title("Bench Press – Ellbogenwinkel & Phasen (entschärft, mean_k)")
+
     plt.plot(df["time_s"], df["upperarm_torso_deg"], label="Shoulder (raw)", alpha=0.35)
     plt.plot(df["time_s"], df["primary_deg_smooth"], label="Shoulder smooth", linewidth=2)
     plt.plot(df["time_s"], df["primary_deg_meank"], label=f"Shoulder mean[{mean_k}]", linewidth=1.5)
     plt.axhline(top_deg, linestyle="--", label=f"Top~{top_deg:.0f}°")
     plt.axhline(bottom_deg, linestyle="--", label=f"Bottom~{bottom_deg:.0f}°")
-    plt.xlabel("Zeit (s)"); plt.ylabel("Grad")
-    plt.legend(); plt.tight_layout()
-    plt.savefig(outdir / "elbow_timeseries.png", dpi=200); plt.close()
-
-    plt.figure(figsize=(12,2.6))
-    plt.title("Phase (TOP=0, DOWN=1, BOTTOM=2, UP=3)")
-    map_phase = {"TOP":0,"DOWN":1,"BOTTOM":2,"UP":3}
-    plt.plot(df["time_s"], df["phase"].map(map_phase))
-    plt.yticks([0,1,2,3], ["TOP","DOWN","BOTTOM","UP"])
     plt.xlabel("Zeit (s)")
+    plt.ylabel("Grad")
+
+    # --- Rep-Marker einfügen ---
+    mask_rep = df["event"].fillna("").eq("rep++")
+    rep_times = df.loc[mask_rep, "time_s"].to_numpy()
+    rep_ids   = df.loc[mask_rep, "rep_id"].to_numpy()
+
+    # y-Position der Labels knapp oberhalb der Kurve bestimmen
+    y_series = df["primary_deg_smooth"]
+    y_max = float(np.nanmax(y_series))
+    y_label = y_max + max(2.0, 0.02 * y_max)  # etwas Abstand
+
+    for t_rep, rid in zip(rep_times, rep_ids):
+        plt.axvline(t_rep, linestyle="--", linewidth=1.2, alpha=0.7)
+        plt.text(t_rep, y_label, f"{int(rid)}", rotation=90, va="bottom", ha="center", fontsize=9)
+
+    # Optional: Marker-Punkte direkt auf der Kurve
+    if len(rep_times) > 0:
+        y_at_rep = np.interp(rep_times, df["time_s"], y_series)
+        plt.scatter(rep_times, y_at_rep, s=35, zorder=3)
+
+    plt.legend()
+
+    # Falls Text oben abgeschnitten wäre → etwas mehr Platz lassen
+    ymin, ymax = plt.ylim()
+    plt.ylim(ymin, max(ymax, y_label + 1.0))
+
     plt.tight_layout()
-    plt.savefig(outdir / "phases.png", dpi=200); plt.close()
+    plt.savefig(outdir / "elbow_timeseries.png", dpi=200)
+    plt.close()
+
 
     # Kurzer Report
     total_reps = int(df["rep_id"].max() if len(df) else 0)
@@ -410,6 +447,7 @@ def process_video(
     print(f"[INFO] Reps gezählt: {total_reps} | Events fail: {fails}")
 
 if __name__ == "__main__":
+    
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True, help="Pfad zum Eingabevideo (.mp4/.mov)")
     ap.add_argument("--outdir", default="runs/bench", help="Output-Ordner")
